@@ -25,7 +25,12 @@ import os
 from .utils import StarteratorError
 import csv
 from . import annotate
+from . import making_files as _making_files
 from collections import Counter
+
+# Toggle to try in-process PDF generation (skips subprocess + serialization).
+# Set to False to fall back to the original subprocess path.
+DIRECT_RENDERING = True
 
 
 class Report(object):
@@ -33,6 +38,20 @@ class Report(object):
         self.output_dir = utils.INTERMEDIATE_DIR
         self.final_dir = utils.FINAL_DIR
         self.base_name = name
+
+    def make_file_direct(self, data, mode, pham_no=None, phage=None,
+                         phage_length=-1, whole_phage=False):
+        """In-process PDF generation — no subprocess, no serialization."""
+        one_or_all = 'All' if whole_phage else 'One'
+        _making_files.run_direct(
+            data=data,
+            mode=mode,
+            pham_no=pham_no,
+            phage=phage,
+            phage_length=phage_length,
+            one_or_all=one_or_all,
+            output_dir=utils.INTERMEDIATE_DIR,
+        )
 
     def make_file(self, specifics, whole_phage=False):
         if whole_phage:
@@ -106,10 +125,16 @@ class PhageReport(Report):
                                                  'pham_no': pham_no}
 
     def make_phage_pages(self):
-        pickle_file = os.path.join(self.output_dir, "%s.pickle" % self.name)
-        pickle.dump(self.phage_genes, open(pickle_file, "wb"))
-        args = ["-p", self.name, "-f", pickle_file, "-l", str(self.seq_length), "-m", "genome"]
-        self.make_file(args, True)
+        if DIRECT_RENDERING:
+            self.make_file_direct(self.phage_genes, mode='genome',
+                                  phage=self.name,
+                                  phage_length=self.seq_length,
+                                  whole_phage=True)
+        else:
+            pickle_file = os.path.join(self.output_dir, "%s.pickle" % self.name)
+            pickle.dump(self.phage_genes, open(pickle_file, "wb"))
+            args = ["-p", self.name, "-f", pickle_file, "-l", str(self.seq_length), "-m", "genome"]
+            self.make_file(args, True)
 
     # def make_suggested_starts_page(self):
     #   pickle_file = 
@@ -451,14 +476,18 @@ class GeneReport(Report):
     def make_report(self, whole=False):
         self.pham.align()
         self.pham.find_most_common_start()
-        pickle_file = os.path.join(self.output_dir, "%s%s.pickle" % (self.pham.file, self.pham.pham_no)) # TODO: Figure out base name things
-        f = open(pickle_file, "wb")
-        pickle.dump(self.pham, f)
-        f.close()
 
-        args = ["-p", self.phage_name, "-n", str(self.pham.pham_no),  "-f", pickle_file, "-m", "text"]
-        self.make_file(args, whole)
-        # graph_args = ["-p", self.phage, "-n", pham_no, "-f", pickle_file, "-m", "graph"]
+        if DIRECT_RENDERING:
+            self.make_file_direct(self.pham, mode='text',
+                                  pham_no=str(self.pham.pham_no),
+                                  phage=self.phage_name,
+                                  whole_phage=whole)
+        else:
+            pickle_file = os.path.join(self.output_dir, "%s%s.pickle" % (self.pham.file, self.pham.pham_no))
+            with open(pickle_file, "wb") as f:
+                pickle.dump(self.pham, f)
+            args = ["-p", self.phage_name, "-n", str(self.pham.pham_no), "-f", pickle_file, "-m", "text"]
+            self.make_file(args, whole)
         return self.pham
 
     def get_specific_gene(self):
@@ -525,27 +554,37 @@ class PhamReport(Report):
         Report.__init__(self)
         self.pham_no = pham_no
 
-    def final_report(self, save_json=False):
-        if save_json:
-            self.make_report(save_json=True)
-        else:
-            self.make_report()
+    def final_report(self, save_json=False, no_pdfs=False, compress_json=False):
+        self.make_report(save_json=save_json, no_pdfs=no_pdfs, compress_json=compress_json)
+        if no_pdfs:
+            if not save_json:
+                raise StarteratorError("--no-pdfs requires JSON output enabled.")
+            json_name = "%s.json%s" % (self.pham_no, ".gz" if compress_json else "")
+            json_path = os.path.join(self.output_dir, json_name)
+            return json_path, json_name
         return self.merge_report()
 
-    def make_report(self, save_json=False):
+    def make_report(self, save_json=False, no_pdfs=False, compress_json=False):
         self.pham = phams.Pham(self.pham_no)
         self.pham.align()
         self.pham.find_most_common_start()
-        pickle_file = os.path.join(self.output_dir, "%s.pickle" % self.pham.pham_no)  # TODO:Figure out base name things
-        f = open(pickle_file, "wb")
-        pickle.dump(self.pham, f)
-        f.close()
-        if save_json:
-            json_file = pickle_file.replace(".pickle", ".json")
-            self.pham.export_json(json_file)
 
-        args = ["-n", self.pham_no, "-f", pickle_file, '-m', "text"]
-        self.make_file(args)
+        if save_json:
+            json_file = os.path.join(self.output_dir, "%s.json" % self.pham.pham_no)
+            self.pham.export_json(json_file, compress=compress_json)
+
+        if no_pdfs:
+            return
+
+        if DIRECT_RENDERING:
+            self.make_file_direct(self.pham, mode='text',
+                                  pham_no=self.pham_no)
+        else:
+            pickle_file = os.path.join(self.output_dir, "%s.pickle" % self.pham.pham_no)
+            with open(pickle_file, "wb") as f:
+                pickle.dump(self.pham, f)
+            args = ["-n", self.pham_no, "-f", pickle_file, '-m', "text"]
+            self.make_file(args)
 
     def merge_report(self):
         merger = PyPDF2.PdfWriter()

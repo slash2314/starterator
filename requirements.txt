@@ -4,10 +4,15 @@ pymysql>=1.0.0
 
 # Bioinformatics libraries
 biopython>=1.78
+numpy>=1.26.0
 
 # PDF generation and manipulation
-reportlab>=3.5.0
+# Use ReportLab C acceleration where available for faster PDF rendering.
+reportlab[accel]>=4.4.10
 PyPDF2>=2.0.0
+
+# Fast JSON serialization
+orjson>=3.9.0
 
 # Web scraping and HTTP requests (for annotation features)
 requests>=2.25.0

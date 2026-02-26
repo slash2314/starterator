@@ -1,6 +1,6 @@
 # Starterator Batch Processing Docker Image
-# Using Python 3.13 (latest stable as of 2025)
-FROM python:3.13-slim
+# Using Python 3.14 (latest stable as of 2026)
+FROM python:3.14-slim
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y \
     # ClustalW for multiple sequence alignment  
     clustalw \
     clustalo \
+    mafft \
     parallel \
     vim \
     # Build tools for Python packages
@@ -50,20 +51,23 @@ ENV DB_PORT="3306"
 # Configure default paths
 ENV BLAST_DIR="/usr/bin/"
 ENV CLUSTALW_DIR="/usr/bin/"
+ENV STARTERATOR_CONFIG_DIR="/app/config"
+ENV STARTERATOR_INTERMEDIATE_DIR="/tmp/starterator_temp"
+ENV STARTERATOR_FINAL_DIR="/app/reports"
 ENV CONFIG_DIR="/app/config"
 ENV INTERMEDIATE_DIR="/tmp/starterator_temp"
 ENV FINAL_DIR="/app/reports"
 
-# Set the entrypoint to the starterate script
-WORKDIR /app/starterator
-ENTRYPOINT ["python3", "starterate.py"]
+# Set the entrypoint to the starterate module
+WORKDIR /app
+ENTRYPOINT ["python3", "-m", "starterator.starterate"]
 
 # Default command is batch processing
 CMD ["--all-phams"]
 
 # Health check to verify the application can start
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python3 starterate.py --help > /dev/null || exit 1
+    CMD python3 -m starterator.starterate --help > /dev/null || exit 1
 
 # Labels for metadata
 LABEL maintainer="Starterator Project"

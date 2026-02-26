@@ -9,9 +9,13 @@
 # April 4, 2014
 # Utility functions for Starterator
 
-import pymysql
-pymysql.install_as_MySQLdb()
-import pymysql as MySQLdb
+try:
+    import pymysql
+    pymysql.install_as_MySQLdb()
+    import pymysql as MySQLdb
+except ImportError:
+    pymysql = None
+    MySQLdb = None
 import configparser as ConfigParser
 import getpass
 import os, subprocess
@@ -304,6 +308,8 @@ def create_folders():
         os.mkdir(os.path.join(os.environ["HOME"], ".starterator", "Report Files"))
 
 def db_connect(config_info):
+    if MySQLdb is None:
+        raise StarteratorError("PyMySQL is required for MySQL mode.")
     db = MySQLdb.connect(config_info['database_server'], 
             config_info['database_user'],
             config_info['database_password'],
@@ -311,6 +317,8 @@ def db_connect(config_info):
     return db
     
 def attempt_db_connect(config_info):
+    if MySQLdb is None:
+        raise StarteratorError("PyMySQL is required for MySQL mode.")
     try:
         print('attempting to connect', config_info)
         db = MySQLdb.connect(config_info['database_server'], 
@@ -330,4 +338,3 @@ def attempt_db_connect(config_info):
 def clean_up_files(file_dir):
     for f in os.listdir(file_dir):
         os.remove(os.path.join(file_dir, f))
-

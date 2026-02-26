@@ -18,6 +18,7 @@ from Bio.Graphics import GenomeDiagram
 from Bio.SeqFeature import SeqFeature, FeatureLocation
 import reportlab.lib.pagesizes
 from reportlab.pdfgen import canvas
+from reportlab.graphics import renderPDF
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -26,12 +27,27 @@ import PyPDF2
 from Bio import SeqIO
 import math
 from io import StringIO, BytesIO
+from collections import Counter
 from starterator.utils import *
 from starterator.phams import *
 from starterator.phamgene import *
 import os
 # from phage import
 # from reportlab.lib import colors
+
+# BioPython's Feature.__init__ creates a new ColorTranslator for every single
+# feature, which builds 17 Color objects each time.  Share a single instance
+# across all Features to avoid millions of throwaway allocations.
+from Bio.Graphics.GenomeDiagram._Feature import Feature as _GDFeature
+from Bio.Graphics.GenomeDiagram._Colors import ColorTranslator as _ColorTranslator
+_GDFeature._shared_colortranslator = _ColorTranslator()
+_orig_gd_feature_init = _GDFeature.__init__
+
+def _patched_gd_feature_init(self, *args, **kwargs):
+    _orig_gd_feature_init(self, *args, **kwargs)
+    self._colortranslator = _GDFeature._shared_colortranslator
+
+_GDFeature.__init__ = _patched_gd_feature_init
 
 
 def parse_arguments():
@@ -91,7 +107,7 @@ def output_start_sites(stats):
         # start section on summary of annotations:
         output.append('<b>Summary of Final Annotations (See graph section above for start numbers):</b>')
 
-        if annotated_count > 0:
+        if annotated_count > 0 and most_annotated_start in stats["called_starts"]:
             annotated_with_most_annotated_called = \
                 [g.full_name for g in stats["annot_list"] if g.full_name in stats["called_starts"][most_annotated_start]]
             # annotated_with_most_predicted_called = \
@@ -137,12 +153,23 @@ def output_start_sites(stats):
                 s += gene + ", "
             output.append(s + '')
             output.append('')
+        elif annotated_count > 0:
+            output.append(
+                "Manual annotations are present, but none map to a canonical start number in this alignment."
+            )
+            output.append('')
         else:
             output.append("This pham is comprised of all draft annotations. There are no annotations to summarize.")
 
         # start section summary of start sites by number
         output.append("<b>Summary by start number:</b>")
         output.append('')
+        cluster_dict = {}
+        for p_gene in stats['annot_list']:
+            cluster_dict[p_gene.full_name] = p_gene.subcluster
+
+        for p_gene in stats['draft_list']:
+            cluster_dict[p_gene.full_name] = p_gene.subcluster
 
         for start, genes in stats["called_starts"].items():
             if len(genes) == 0:
@@ -161,13 +188,6 @@ def output_start_sites(stats):
 
             percent_called = float(len(genes)) / presence * 100
             output.append('\u2022' + " Called %10.1f%% of time when present \n\t" % percent_called)
-
-            cluster_dict = {}
-            for p_gene in stats['annot_list']:
-                cluster_dict[p_gene.full_name] = p_gene.subcluster
-
-            for p_gene in stats['draft_list']:
-                cluster_dict[p_gene.full_name] = p_gene.subcluster
 
             genes.sort()
             s = ''
@@ -205,8 +225,12 @@ def output_start_sites(stats):
                     count_MA += 1
             if count_MA > 0:
                 output.append("Info for manual annotations of cluster %s:" % cluster)
-                annotated_cluster_starts = [ph.alignment_start_num_called for ph in stats['annot_list'] if ph.subcluster == cluster]
-                start_counts = dict([(x,annotated_cluster_starts.count(x)) for x in set(annotated_cluster_starts)])
+                annotated_cluster_starts = [
+                    ph.alignment_start_num_called
+                    for ph in stats['annot_list']
+                    if ph.subcluster == cluster and ph.alignment_start_num_called is not None
+                ]
+                start_counts = Counter(annotated_cluster_starts)
                 starts_present = sorted(start_counts.keys())
                 for start in starts_present:
                     count = start_counts[start]
@@ -252,7 +276,7 @@ def output_start_sites_by_phage(stats, genelist):
     # start section on summary of annotations:
     output.append('Summary of Final Annotations (See graph section above for start numbers):')
 
-    if annotated_count > 0:
+    if annotated_count > 0 and most_annotated_start in stats["called_starts"]:
         annotated_with_most_annotated_called = \
             [g.full_name for g in stats["annot_list"] if g.full_name in stats["called_starts"][most_annotated_start]]
         # annotated_with_most_predicted_called = \
@@ -281,6 +305,11 @@ def output_start_sites_by_phage(stats, genelist):
 
         output.append('')
 
+    elif annotated_count > 0:
+        output.append(
+            "Manual annotations are present, but none map to a canonical start number in this alignment."
+        )
+        output.append('')
     else:
         output.append("This pham is comprised of all draft annotations. There are no annotations to summarize.")
         output.append('')
@@ -307,6 +336,12 @@ def output_start_sites_by_phage(stats, genelist):
         all_annotated_starts = list(set(all_annotated_starts))
     else:
         all_annotated_starts = genelist[0].alignment_annot_start_nums
+    cluster_dict = {}
+    for p_gene in stats['annot_list']:
+        cluster_dict[p_gene.full_name] = p_gene.subcluster
+
+    for p_gene in stats['draft_list']:
+        cluster_dict[p_gene.full_name] = p_gene.subcluster
 
     for start in all_annotated_starts:
         output.append("Start %s:" % str(start))
@@ -319,13 +354,6 @@ def output_start_sites_by_phage(stats, genelist):
         output.append('\u2022' + " Called %10.1f%% of time when present \n\t" % percent_called)
 
         genes = stats["called_starts"][start]
-
-        cluster_dict = {}
-        for p_gene in stats['annot_list']:
-            cluster_dict[p_gene.full_name] = p_gene.subcluster
-
-        for p_gene in stats['draft_list']:
-            cluster_dict[p_gene.full_name] = p_gene.subcluster
 
         genes.sort()
         s = ''
@@ -365,7 +393,7 @@ def output_start_sites_by_phage(stats, genelist):
         if count_MA > 0:
             output.append("Info for manual annotations of cluster %s:" % cluster)
             annotated_cluster_starts = [ph.alignment_start_num_called for ph in stats['annot_list'] if ph.subcluster == cluster]
-            start_counts = dict([(x,annotated_cluster_starts.count(x)) for x in set(annotated_cluster_starts)])
+            start_counts = Counter(annotated_cluster_starts)
             starts_present = sorted(start_counts.keys())
             for start in starts_present:
                 count = start_counts[start]
@@ -412,6 +440,20 @@ def add_pham_no_title(args, pham_no, first_graph_path, i="", zoom=False):
     output_strm.close()
 
 
+def write_graph_with_title(gd_diagram, output_path, pham_no, zoom=False):
+    """
+    Render a graph page and title in one PDF write, preserving title position/style
+    while avoiding a second PyPDF2 merge pass.
+    """
+    canvas_obj = canvas.Canvas(output_path, pagesize=reportlab.lib.pagesizes.letter)
+    renderPDF.draw(gd_diagram.drawing, canvas_obj, 0, 0)
+    if zoom:
+        canvas_obj.drawString(250, 750, 'Zoomed Pham ' + str(pham_no))
+    else:
+        canvas_obj.drawString(280, 750, 'Pham ' + str(pham_no))
+    canvas_obj.save()
+
+
 def combine_graphs(args, phage, pham_no, num_pages):
     writer = PyPDF2.PdfWriter()
     for j in range(0, num_pages + 1):
@@ -424,7 +466,23 @@ def combine_graphs(args, phage, pham_no, num_pages):
         writer.write(output_file)
 
 
-def make_gene_track(gd_diagram, pham, gene_group, num_on_diagram, total, seqColor):
+def iter_alignment_features(gene):
+    runs = getattr(gene, "alignment_feature_runs", None)
+    if runs is not None:
+        for start, end, feature_type in runs:
+            yield SeqFeature(FeatureLocation(start, end), type=feature_type)
+        return
+
+    alignment = getattr(gene, "alignment", None)
+    if alignment is None:
+        return
+
+    for feature in getattr(alignment, "features", []):
+        yield feature
+
+
+def make_gene_track(gd_diagram, pham, gene_group, num_on_diagram, total, seqColor, start_num_by_site,
+                    draw_left=0, draw_right=None, _cached_colors=None):
     """
 
     :param gd_diagram:
@@ -432,10 +490,12 @@ def make_gene_track(gd_diagram, pham, gene_group, num_on_diagram, total, seqColo
     :param gene_group:
     :param num_on_diagram:
     :param total:
+    :param draw_left: left boundary of the visible draw region
+    :param draw_right: right boundary of the visible draw region
+    :param _cached_colors: pre-built Color objects to avoid re-creation
     :return:
     """
 
-    start_bar_colors = ['purple', 'red', 'lightblue', 'orange', 'tan', 'brown']
     gene = gene_group[0]
 
     # change track_name to name of fist gene in list
@@ -451,21 +511,41 @@ def make_gene_track(gd_diagram, pham, gene_group, num_on_diagram, total, seqColo
     gd_seq_set = gd_gene_track.new_set()
     gd_feature_set = gd_gene_track.new_set()
 
+    if draw_right is None:
+        draw_right = len(gene.alignment)
+
+    if _cached_colors is None:
+        _cached_colors = {}
+
+    trackColor = _cached_colors.get(('track', seqColor % 2))
+    if trackColor is None:
+        if seqColor % 2 == 0:
+            trackColor = colors.Color(253/255, 191/255, 203/255)
+        else:
+            trackColor = colors.Color(237/255, 205/255, 223/255)
+        _cached_colors[('track', seqColor % 2)] = trackColor
+
     start_site = gene.alignment_start_site
     start_site_feature = SeqFeature(FeatureLocation(start_site, start_site + 1))
-    for feature in gene.alignment.features:
+    for feature in iter_alignment_features(gene):
         if feature.type == 'seq':
-            if seqColor % 2 == 0:
-                trackColor = (253, 191, 203)
-            else:
-                trackColor = (237, 205, 223)
+            # Skip features entirely outside the visible draw region.
+            if feature.location.end <= draw_left or feature.location.start >= draw_right:
+                continue
             gd_seq_set.add_feature(feature, color=trackColor)
     for site in gene.alignment_candidate_starts:
-        site_color = pham.total_possible_starts.index(site) % len(start_bar_colors)
+        if site < draw_left or site >= draw_right:
+            continue
+        start_num = start_num_by_site[site]
+        start_bar_color = _cached_colors.get(('bar', start_num))
+        if start_bar_color is None:
+            bar_names = ['purple', 'red', 'lightblue', 'orange', 'tan', 'brown']
+            start_bar_color = colors.toColor(bar_names[(start_num - 1) % len(bar_names)])
+            _cached_colors[('bar', start_num)] = start_bar_color
         possible_site = SeqFeature(FeatureLocation(site, site))
-        gd_feature_set.add_feature(possible_site, color=start_bar_colors[site_color],
-                                   name=str(pham.total_possible_starts.index(site) + 1), label=True)
-    end_gene_feature = SeqFeature(FeatureLocation(len(gene.alignment), 
+        gd_feature_set.add_feature(possible_site, color=start_bar_color,
+                                   name=str(start_num), label=True)
+    end_gene_feature = SeqFeature(FeatureLocation(len(gene.alignment),
                                   len(gene.alignment)+1))
 
     # draw blue called start only if non-draft gene in gene group, if all draft use yellow
@@ -474,13 +554,19 @@ def make_gene_track(gd_diagram, pham, gene_group, num_on_diagram, total, seqColo
     for gene in gene_group:
         all_draft_status = all_draft_status and gene.draftStatus
 
-    if all_draft_status:
-        startcolor = "yellow"
-    else:
-        startcolor = "green"
+    color_key = 'start_yellow' if all_draft_status else 'start_green'
+    startcolor = _cached_colors.get(color_key)
+    if startcolor is None:
+        startcolor = colors.toColor('yellow' if all_draft_status else 'green')
+        _cached_colors[color_key] = startcolor
+
+    end_color = _cached_colors.get('end_purple')
+    if end_color is None:
+        end_color = colors.toColor('purple')
+        _cached_colors['end_purple'] = end_color
 
     gd_feature_set.add_feature(start_site_feature, color=startcolor, label=True)
-    gd_feature_set.add_feature(end_gene_feature, color='purple', label=True)
+    gd_feature_set.add_feature(end_gene_feature, color=end_color, label=True)
 
 
 def graph_start_sites(args, pham, file_path):
@@ -496,17 +582,27 @@ def graph_start_sites(args, pham, file_path):
         order_by = args.phage
 
     genes = pham.group_similar_genes(order_by)
+    if not genes or not pham.total_possible_starts:
+        return
+    start_num_by_site = {site: i + 1 for i, site in enumerate(pham.total_possible_starts)}
 
     # check for especially long upstream sequences, and define genome diagram left boundary if found
     min_start_coord = min(pham.total_possible_starts)
     max_start_coord = max(pham.total_possible_starts)
 
     annotated_start_nums = set()
+    max_start_num = len(pham.total_possible_starts)
     for gene_list in genes:
-        annotated_start_nums.add(gene_list[0].alignment_start_num_called)
+        called_num = gene_list[0].alignment_start_num_called
+        if isinstance(called_num, int) and 1 <= called_num <= max_start_num:
+            annotated_start_nums.add(called_num)
 
-    min_annot_num = min(annotated_start_nums)
-    max_annot_num = max(annotated_start_nums)
+    if annotated_start_nums:
+        min_annot_num = min(annotated_start_nums)
+        max_annot_num = max(annotated_start_nums)
+    else:
+        min_annot_num = 1
+        max_annot_num = max_start_num
     min_annot_coord = pham.total_possible_starts[min_annot_num - 1]
     max_annot_coord = pham.total_possible_starts[max_annot_num - 1]
     # range of interest (roi) will be range of annots plus one more on each side
@@ -573,19 +669,18 @@ def graph_start_sites(args, pham, file_path):
         left_draw_boundary = max([0, min_start_coord - 30])
         right_draw_boundary = min([len(genes[0][0].alignment), max_start_coord + 30])
 
+    color_cache = {}
+
     if len(genes) > 50:
         seqColor = 0
         for i in range(0, int(math.ceil(len(genes)/50.0))):
             gd_diagram = GenomeDiagram.Diagram(pham.pham_no)
             if not args.phage:
                 final_graph_path = os.path.join(file_path, "OnePham%sGraph%d.pdf" % (pham.pham_no, i))
-                graph_path = os.path.join(file_path, "OnePham%sGraph_%d.pdf" % (pham.pham_no, i))
 
             else:
                 final_graph_path = os.path.join(file_path,
                                                 "%sPham%sGraph%d.pdf" % (args.phage + args.one_or_all, pham.pham_no, i))
-                graph_path = os.path.join(file_path,
-                                          "%sPham%sGraph_%d.pdf" % (args.phage + args.one_or_all, pham.pham_no, i))
 
             if check_file(final_graph_path):
                 continue
@@ -602,29 +697,24 @@ def graph_start_sites(args, pham, file_path):
                         if genes[i*50 + j][0].subcluster != genes[i*50 +j - 1][0].subcluster:
                             seqColor += 1
                     gene = genes[i*50 + j][0]
-                    make_gene_track(gd_diagram, pham, genes[i*50 + j], i*50 + j, 50, seqColor)
+                    make_gene_track(gd_diagram, pham, genes[i*50 + j], i*50 + j, 50, seqColor, start_num_by_site,
+                                    draw_left=left_draw_boundary, draw_right=right_draw_boundary,
+                                    _cached_colors=color_cache)
 
             gd_diagram.draw(format="linear", orientation="portrait", pagesize=reportlab.lib.pagesizes.letter,
                             fragments=1, start=left_draw_boundary, end=right_draw_boundary)
-            gd_diagram.write(graph_path, "PDF")
+            write_graph_with_title(gd_diagram, final_graph_path, args.pham_no, should_zoom)
             # gd_diagram.write(graph_path_svg, "SVG")
-
-            add_pham_no_title(args, args.pham_no, graph_path, str(i), should_zoom)
 
         combine_graphs(args, args.phage, pham.pham_no, i)
     else:
-        if not args.phage:
-            final_graph_path = os.path.join(file_path, "Pham%sGraph_.pdf" % pham.pham_no)
-        else:
-            final_graph_path = os.path.join(file_path, "%sPham%sGraph_.pdf" % (args.phage+args.one_or_all, pham.pham_no))
+        output_graph_path = os.path.join(
+            file_path,
+            "%sPham%sGraph.pdf" % (args.phage + args.one_or_all, pham.pham_no),
+        )
         # graph_path_svg = "%sPham%sGraph.svg" % (file_path+args.phage+ args.one_or_all, pham.pham_no)
-        if not args.phage:
-            graph_path = os.path.join(file_path, "Pham%sGraph_.pdf" % pham.pham_no)
-        else:
-            graph_path = os.path.join(file_path, "%sPham%sGraph_.pdf" % (args.phage, pham.pham_no))
-        # print "making_files.graph_start_sites: path to graph is " + str(graph_path)
 
-        if check_file(final_graph_path):
+        if check_file(output_graph_path):
             pass
         else:
             gd_diagram = GenomeDiagram.Diagram(pham.pham_no)
@@ -636,13 +726,14 @@ def graph_start_sites(args, pham, file_path):
                     if genes[i][0].subcluster != genes[i-1][0].subcluster:
                         seqColor += 1
                 # print 'making_files.graph_start_sites: adding group ' + str(i)
-                make_gene_track(gd_diagram, pham, gene_group, i, len(genes), seqColor)
+                make_gene_track(gd_diagram, pham, gene_group, i, len(genes), seqColor, start_num_by_site,
+                                draw_left=left_draw_boundary, draw_right=right_draw_boundary,
+                                _cached_colors=color_cache)
                 i += 1
             gd_diagram.draw(format="linear", orientation="portrait", pagesize=reportlab.lib.pagesizes.letter,
                             fragments=1, start=left_draw_boundary, end=right_draw_boundary)
-            gd_diagram.write(graph_path, "PDF")
+            write_graph_with_title(gd_diagram, output_graph_path, pham.pham_no, should_zoom)
         # gd_diagram.write(graph_path_svg, "SVG")
-            add_pham_no_title(args, pham.pham_no, graph_path, zoom=should_zoom)
 
         # gd_diagram.write("%s.svg" % (file_path+pham.pham_no), "SVG")
         # gd_diagram.write("%s.eps" % (file_path+pham.pham_no), "EPS")
@@ -759,19 +850,25 @@ def make_pham_text(args, pham, pham_no, output_dir, only_pham=False):
     text_style.fontName = 'Helvetica'
     text_style.leading = 12
 
+    def build_coord_by_start(gene):
+        coords = gene.alignment_indices_to_coords_optimized(gene.alignment_candidate_starts)
+        return dict(zip(gene.alignment_candidate_starts, coords))
+
     if only_pham:  # The text if working on single pham, no particular phage
         gene_list = list(pham.genes.values())
         gene_list.sort(key=lambda x: x.phage_name)
         for gene in gene_list:
             candidate_starts = ""
+            coord_by_start = build_coord_by_start(gene)
             for start_num, start in zip(gene.alignment_candidate_start_nums, gene.alignment_candidate_starts):
+                start_coord = coord_by_start[start]
                 if start_num in gene.alignment_annot_start_nums:
                     count = gene.alignment_annot_counts_by_start[start_num]
                     message = 'MA: <b>' + str(count) + '</b>'
-                    candidate_starts += '(Start: ' + str(start_num) + ' @' + str(gene.alignment_index_to_coord(start)) + \
+                    candidate_starts += '(Start: ' + str(start_num) + ' @' + str(start_coord) + \
                                         ' has ' + str(count) + " MA's), "
                 else:
-                    candidate_starts += '(' + str(start_num) + ', ' + str(gene.alignment_index_to_coord(start)) + '), '
+                    candidate_starts += '(' + str(start_num) + ', ' + str(start_coord) + '), '
 
             story.append(Paragraph(" Gene: %s \n Start: %s, Stop: %s, Start Num: %s " % (gene.full_name,
                                    gene.start_codon_location, gene.stop_codon_location,
@@ -783,14 +880,16 @@ def make_pham_text(args, pham, pham_no, output_dir, only_pham=False):
     else:   # if working on a pham report for one particular phage then only list starts for that phage
         for gene in genes_in_phage:
             candidate_starts = ""
+            coord_by_start = build_coord_by_start(gene)
             for start_num, start in zip(gene.alignment_candidate_start_nums, gene.alignment_candidate_starts):
+                start_coord = coord_by_start[start]
                 if start_num in gene.alignment_annot_start_nums:
                     count = gene.alignment_annot_counts_by_start[start_num]
                     message = 'MA: <b>' + str(count) + '</b>'
-                    candidate_starts += '(Start: ' + str(start_num) + ' @' + str(gene.alignment_index_to_coord(start)) + \
+                    candidate_starts += '(Start: ' + str(start_num) + ' @' + str(start_coord) + \
                                         ' has ' + str(count) + " MA's), "
                 else:
-                    candidate_starts += '(' + str(start_num) + ', ' + str(gene.alignment_index_to_coord(start)) + '), '
+                    candidate_starts += '(' + str(start_num) + ', ' + str(start_coord) + '), '
 
             story.append(Paragraph(" Gene: %s \n Start: %s, Stop: %s, Start Num: %s " % (gene.full_name,
                                    gene.start_codon_location, gene.stop_codon_location,
@@ -1009,6 +1108,42 @@ def make_suggested_starts(phage_genes, phage_name, file_path):
 def make_fasta_file(genes, fasta_file):
     count = SeqIO.write(genes, fasta_file, 'fasta')
     # print "%s Fasta files written" % count
+
+
+def run_direct(data, mode, pham_no=None, phage=None, phage_length=-1,
+               one_or_all='One', output_dir=None):
+    """In-process entry point — avoids subprocess + pickle overhead.
+
+    Parameters match what main() would extract from argparse + pickle:
+      data        – the already-loaded Pham (or phage_genes dict for 'genome')
+      mode        – one of 'text', 'graph', 'genome', 'starts'
+      pham_no     – pham number string
+      phage       – phage name (None for pham-only reports)
+      phage_length – genome length (only needed for 'genome' mode)
+      one_or_all  – 'One' or 'All'
+      output_dir  – intermediate output directory
+    """
+    from types import SimpleNamespace
+    args = SimpleNamespace(
+        phage=phage,
+        pham_no=pham_no,
+        one_or_all=one_or_all,
+        dir=output_dir,
+    )
+
+    if mode == 'graph':
+        graph_start_sites(args, data, output_dir)
+    elif mode == 'starts':
+        make_suggested_starts(data, phage, output_dir)
+    elif mode == 'genome':
+        make_pham_genome(data, phage, phage_length, output_dir)
+        make_suggested_starts(data, phage, output_dir)
+    elif mode == 'text':
+        graph_start_sites(args, data, output_dir)
+        if not phage:
+            make_pham_text(args, data, pham_no, output_dir, only_pham=True)
+        else:
+            make_pham_text(args, data, pham_no, output_dir)
 
 
 def main():

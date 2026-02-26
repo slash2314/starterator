@@ -8,7 +8,7 @@ def new_phage(phage_id=None, name=None, cluster=None, sequence=None):
     if not phage_id:
         phage = Phage(phage_id, name, cluster, sequence)
         phage_id = phage.get_id()
-    if phage_list.get(phage_id, True):
+    if phage_id not in phage_list:
         phage_list[phage_id] = Phage(phage_id, name, cluster, sequence)
     return phage_list[phage_id]
 

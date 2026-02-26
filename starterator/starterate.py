@@ -11,10 +11,20 @@
 # Starterate function 
 
 import argparse
+import json
+import sys
 from multiprocessing import Pool, Process, Queue, Semaphore
-from .phams import compare_hashes_current, generate_pham_hashes, get_all_phams, process_all_phams
+from .phams import (
+    compare_hash_snapshots,
+    compare_hashes_current,
+    generate_pham_hashes,
+    get_all_phams,
+    process_all_phams,
+    process_pham_list,
+    process_phams_from_file,
+)
 from . import utils
-from .utils import clean_up_files
+from .utils import clean_up_files, StarteratorError
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -61,7 +71,7 @@ def get_output_one_pham(pham, pham_no, config):
         story.append(Paragraph(text, styles["Normal"]))
     doc.build(story)
 
-def get_arguments():
+def build_parser():
     parser = argparse.ArgumentParser(prog='starterate.py', usage='Phameratored Phage Report: %(prog)s -p {Phage Name}\n'
             + 'One Gene of Phameratored Phage Report:  %(prog)s -p {Phage Name} -n {Pham Number}\n'
             + 'Unphameratored Phage Report:  %(prog)s -p {Phage Name} -u True -f {Path to DNAMaster profile file}\n'
@@ -87,8 +97,14 @@ def get_arguments():
     parser.add_argument('-f', '--fasta', help='Path to Fasta File')
     parser.add_argument('-j', '--save_json', type=bool, default=False,
                         help='Boolean, use with -n to save json file describing complete results.')
+    parser.add_argument('--compress-json', action='store_true',
+                        help='Compress JSON output as .json.gz (default JSON output is uncompressed).')
+    parser.add_argument('--no-pdfs', action='store_true',
+                        help='Skip PDF generation and only emit JSON output (pham report mode).')
     parser.add_argument('--all-phams', action='store_true',
                         help='Batch process all phams in the database')
+    parser.add_argument('--with-phams', type=str, default=None,
+                        help='Process phams listed in a line-delimited file (one pham ID per line)')
     parser.add_argument('--verbose', action='store_true',
                         help='Enable verbose output')
     parser.add_argument('--get-phams', action='store_true',
@@ -97,7 +113,57 @@ def get_arguments():
                         help='Get all pham hashes')
     parser.add_argument('--compare-hash-files', nargs=2, metavar=('FILE1', 'FILE2'),
                         help='Compare two hash files')
-    return parser.parse_args()
+    parser.add_argument('--delta-phams', type=str, default=None,
+                        help='Process only added or modified phams compared to a previous hash file')
+    return parser
+
+
+def _get_selected_primary_modes(args):
+    selected_modes = []
+    if args.delta_phams:
+        selected_modes.append('--delta-phams')
+    if args.compare_hash_files:
+        selected_modes.append('--compare-hash-files')
+    if args.get_phams:
+        selected_modes.append('--get-phams')
+    if args.get_pham_hashes:
+        selected_modes.append('--get-pham-hashes')
+    if args.all_phams:
+        selected_modes.append('--all-phams')
+    if args.with_phams:
+        selected_modes.append('--with-phams')
+    if args.phage is not None:
+        selected_modes.append('--phage')
+    elif args.pham_no != -1:
+        selected_modes.append('--pham_no')
+    return selected_modes
+
+
+def validate_primary_mode(args, parser):
+    selected_modes = _get_selected_primary_modes(args)
+    if len(selected_modes) > 1:
+        parser.error("primary operation modes are mutually exclusive: %s" % ", ".join(selected_modes))
+
+
+def get_arguments(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    validate_primary_mode(args, parser)
+    return args
+
+
+def _load_previous_hash_snapshot(previous_hash_file):
+    try:
+        with open(previous_hash_file, 'r') as f:
+            return json.load(f)
+    except OSError as exc:
+        raise StarteratorError(
+            "Could not read previous pham hash file %s: %s" % (previous_hash_file, exc)
+        )
+    except ValueError as exc:
+        raise StarteratorError(
+            "Invalid JSON in previous pham hash file %s: %s" % (previous_hash_file, exc)
+        )
 
 
 
@@ -145,7 +211,7 @@ from . import utils
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def main():
+def main(argv=None):
     # Use the same configuration approach as utils.py
     config_path = os.path.abspath(os.path.join(
         os.getenv("STARTERATOR_CONFIG_DIR", os.path.join(os.environ["HOME"], ".starterator")), 
@@ -153,7 +219,7 @@ def main():
     
     # Configuration will be created automatically if it doesn't exist
     config = utils.get_config()
-    args = get_arguments()
+    args = get_arguments(argv)
     if args.verbose:
         # Log the content of the configuration file
         with open(config_path, 'r') as config_file:
@@ -189,47 +255,84 @@ def main():
 
     phamgene.check_protein_db(config["count"])
 
+    if args.delta_phams:
+        try:
+            previous_hash = _load_previous_hash_snapshot(args.delta_phams)
+            current_hash = generate_pham_hashes(output_file=True)
+            results = compare_hash_snapshots(previous_hash, current_hash)
+        except (KeyError, TypeError, StarteratorError) as e:
+            logging.error(str(e))
+            sys.exit(1)
+
+        candidate_phams = set(results["phams_added"]) | set(results["phams_modified"])
+        eligible_phams = [
+            pham_id for pham_id in get_all_phams()
+            if str(pham_id) in candidate_phams
+        ]
+        if not eligible_phams:
+            print("No eligible changed phams found; nothing to process.")
+            return
+        process_pham_list(
+            eligible_phams,
+            no_pdfs=args.no_pdfs,
+            compress_json=args.compress_json,
+        )
+        return
+
     if args.all_phams:
-        process_all_phams()
+        process_all_phams(no_pdfs=args.no_pdfs, compress_json=args.compress_json)
+        return
+
+    if args.with_phams:
+        process_phams_from_file(
+            args.with_phams,
+            no_pdfs=args.no_pdfs,
+            compress_json=args.compress_json,
+        )
         return
 
 
-    # --Phamerated and only one gene
-    if args.gene_number != -1 and args.phage is not None and args.unphamed is False:
-        gene = report.GeneReport(args.phage, args.gene_number, True)
-        # print gene
-        gene.get_pham()
-        gene.make_report()
-        final_file, s = gene.merge_report()
+    try:
+        # --Phamerated and only one gene
+        if args.gene_number != -1 and args.phage is not None and args.unphamed is False:
+            gene = report.GeneReport(args.phage, args.gene_number, True)
+            # print gene
+            gene.get_pham()
+            gene.make_report()
+            final_file, s = gene.merge_report()
 
-    # --Unphameratored Phage with only one gene
-    elif args.given_start > -1 and args.phage is not None and args.unphamed is True:
-        # given start and stop coordinates and orientation
-        one_or_all = 'One'
-        given_start = args.given_start
-        given_stop = args.given_stop
-        given_orientation = args.given_orientation
-        gene_name = args.phage + '_' + str(args.gene_number)
-        gene = report.GeneReport(args.phage, args.gene_number, fasta_file=args.fasta)
-        gene.make_unpham_gene(given_start, given_stop, given_orientation)
-        print(gene)
-        gene.make_report()
-        final_file, s = gene.merge_report()
+        # --Unphameratored Phage with only one gene
+        elif args.given_start > -1 and args.phage is not None and args.unphamed is True:
+            # given start and stop coordinates and orientation
+            one_or_all = 'One'
+            given_start = args.given_start
+            given_stop = args.given_stop
+            given_orientation = args.given_orientation
+            gene_name = args.phage + '_' + str(args.gene_number)
+            gene = report.GeneReport(args.phage, args.gene_number, fasta_file=args.fasta)
+            gene.make_unpham_gene(given_start, given_stop, given_orientation)
+            gene.make_report()
+            final_file, s = gene.merge_report()
 
-    # --Phameratored or Unphameratored Phages with all genes
-    elif args.pham_no == -1 and args.phage is not None and args.unphamed is False:
-        phage = report.PhageReport(args.phage, gui=None)
-        final_file, short_final = phage.final_report()
+        # --Phameratored or Unphameratored Phages with all genes
+        elif args.pham_no == -1 and args.phage is not None and args.unphamed is False:
+            phage = report.PhageReport(args.phage, gui=None)
+            final_file, short_final = phage.final_report()
 
-    elif args.pham_no == -1 and args.phage is not None and args.unphamed is True:
-        phage = report.UnPhamPhageReport(args.phage, fasta_file=args.fasta, profile_file=args.profile, gui=None)
-        final_file, short_final = phage.final_report()
-    elif args.phage is None:
-        pham = report.PhamReport(args.pham_no)
-        if args.save_json is True:
-            final_file, short_final = pham.final_report(save_json=True)
-        else:
-            final_file, short_final = pham.final_report()
+        elif args.pham_no == -1 and args.phage is not None and args.unphamed is True:
+            phage = report.UnPhamPhageReport(args.phage, fasta_file=args.fasta, profile_file=args.profile, gui=None)
+            final_file, short_final = phage.final_report()
+        elif args.phage is None:
+            pham = report.PhamReport(args.pham_no)
+            save_json = args.save_json is True or args.no_pdfs
+            final_file, short_final = pham.final_report(
+                save_json=save_json,
+                no_pdfs=args.no_pdfs,
+                compress_json=args.compress_json,
+            )
+    except StarteratorError as e:
+        logging.error(str(e))
+        sys.exit(1)
 
     # clean_up_files()
     # email_final_report(args.email, short_final)
